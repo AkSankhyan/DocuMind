@@ -65,7 +65,7 @@ const dotVariants = {
 const Chat = () => {
   const theme = useTheme();
   const isMobile = useMediaQuery(theme.breakpoints.down('sm'));
-  const { uploadedFile, fileContent, fileType, chatHistory, addMessageToHistory, clearFile } = useFile();
+  const { uploadedFile, collectionId, docStats, fileContent, fileType, chatHistory, addMessageToHistory, clearFile } = useFile();
   const [input, setInput] = useState('');
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState(null);
@@ -83,85 +83,102 @@ const Chat = () => {
     }
   }, [chatHistory]);
 
-  // Handle submission of a new question
+  // Handle submission of a new question — uses SSE streaming endpoint
   const handleSubmit = async (e) => {
     e.preventDefault();
     if (!input.trim() || isLoading) return;
-    
-    const userMessage = { role: 'user', content: input };
-    addMessageToHistory(userMessage);
+
+    const questionText = input.trim();
+    addMessageToHistory({ role: 'user', content: questionText });
     setInput('');
-    
-    // Generate a unique loading session ID
+
     const currentSessionId = Date.now().toString();
     setLoadingSessionId(currentSessionId);
     setIsLoading(true);
     setError(null);
-    
+
+    // Seed a streaming bot message placeholder
+    const streamingMsg = { role: 'assistant', content: '', citations: [], _streaming: true };
+    addMessageToHistory(streamingMsg);
+
+    let accumulatedText = '';
+    let finalCitations = [];
+
     try {
-      console.log('Chat request URL:', `${config.API_BASE_URL}/api/chat`);
-      console.log('File content available:', !!fileContent);
-      
-      // Check if we have valid file content
-      if (!fileContent || !fileContent.trim()) {
-        throw new Error('No valid document content is available. Please try re-uploading your document.');
-      }
-      
-      if (fileContent.length < 20) {
-        throw new Error('The document content appears to be too short or empty. Please try uploading a different document.');
-      }
-      
-      const requestData = {
-        question: input,
-        file_info: fileContent ? {
-          name: uploadedFile?.name || 'document',
-          type: fileType || 'application/octet-stream',
-          content: fileContent
-        } : null
-      };
-      
-      console.log('Sending request with file info:', {
-        hasContent: !!requestData.file_info?.content,
-        contentLength: requestData.file_info?.content ? requestData.file_info.content.length : 0
+      const response = await fetch(`${config.API_BASE_URL}/api/chat/stream`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ question: questionText, collection_id: collectionId || null }),
       });
-      
-      const response = await axios.post(`${config.API_BASE_URL}/api/chat`, requestData);
-      
-      if (response.data && response.data.status === 'success') {
-        const botMessage = { role: 'assistant', content: response.data.answer };
-        addMessageToHistory(botMessage);
-      } else {
-        throw new Error(response.data?.message || 'Failed to get answer');
+
+      if (!response.ok) {
+        const errData = await response.json().catch(() => ({}));
+        throw new Error(errData.detail || `Server error ${response.status}`);
+      }
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop(); // keep incomplete line in buffer
+
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue;
+          const jsonStr = line.slice(6).trim();
+          if (!jsonStr) continue;
+
+          try {
+            const evt = JSON.parse(jsonStr);
+
+            if (evt.token !== undefined) {
+              accumulatedText += evt.token;
+              // Update the last message (streaming placeholder) in-place
+              addMessageToHistory({
+                role: 'assistant',
+                content: accumulatedText,
+                citations: [],
+                _streaming: true,
+                _replace: true,       // signal context to replace last assistant msg
+              });
+            }
+
+            if (evt.done) {
+              finalCitations = evt.citations || [];
+              // Finalize the message — remove _streaming flag, attach citations
+              addMessageToHistory({
+                role: 'assistant',
+                content: accumulatedText,
+                citations: finalCitations,
+                _streaming: false,
+                _replace: true,
+              });
+            }
+
+            if (evt.error) {
+              throw new Error(evt.error);
+            }
+          } catch (parseErr) {
+            // skip malformed SSE lines
+          }
+        }
       }
     } catch (err) {
-      console.error('Chat error:', err);
-      let errorMessage = 'Failed to get an answer';
-      
-      if (err.response) {
-        // Handle HTTP error responses
-        if (err.response.status === 400) {
-          errorMessage += ': ' + (err.response.data?.detail || 'Bad request');
-        } else if (err.response.status === 500) {
-          errorMessage += ': Server error - ' + (err.response.data?.detail || 'Internal server error');
-        } else {
-          errorMessage += ': ' + (err.response.data?.detail || err.message);
-        }
-      } else if (err.request) {
-        // Handle network errors
-        errorMessage += ': Network error - Could not connect to server';
-      } else {
-        errorMessage += ': ' + err.message;
-      }
-      
+      console.error('Stream error:', err);
+      const errorMessage = err.message || 'Failed to get an answer';
       setError(errorMessage);
-      // Add error message to chat history
-      addMessageToHistory({ 
-        role: 'assistant', 
-        content: 'Sorry, I encountered an error: ' + errorMessage,
-        isError: true 
+      addMessageToHistory({
+        role: 'assistant',
+        content: `Sorry, I encountered an error: ${errorMessage}`,
+        isError: true,
+        _replace: accumulatedText === '',  // only replace placeholder if nothing was streamed
       });
     } finally {
-      // Safety cleanup in case of errors
       setIsLoading(false);
       setLoadingSessionId(null);
     }
@@ -233,6 +250,8 @@ const Chat = () => {
               </Typography>
               <Typography variant="body2" color="textSecondary">
                 {uploadedFile?.size ? `${(uploadedFile.size / 1024).toFixed(1)} KB` : ''}
+                {docStats?.numPages ? ` • ${docStats.numPages} Page(s)` : ''}
+                {docStats?.numChunks ? ` • ${docStats.numChunks} Vector Chunks` : ''}
               </Typography>
             </Box>
           </Box>
@@ -335,6 +354,46 @@ const Chat = () => {
                       {message.role === 'assistant' ? (
                         <Box className="markdown-body">
                           <ReactMarkdown>{message.content}</ReactMarkdown>
+                          {message.citations && message.citations.length > 0 && (
+                            <Box sx={{ mt: 2, pt: 1.5, borderTop: '1px solid #e2e8f0' }}>
+                              <Typography 
+                                variant="caption" 
+                                sx={{ 
+                                  fontWeight: 600, 
+                                  color: 'primary.main', 
+                                  display: 'flex', 
+                                  alignItems: 'center', 
+                                  gap: 0.5,
+                                  mb: 0.8
+                                }}
+                              >
+                                📚 Grounded Sources & Citations:
+                              </Typography>
+                              <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 0.8 }}>
+                                {message.citations.map((cite, cIdx) => (
+                                  <Tooltip 
+                                    key={cIdx} 
+                                    title={
+                                      <Box sx={{ p: 0.5 }}>
+                                        <Typography variant="caption" sx={{ fontWeight: 600 }}>Excerpt:</Typography>
+                                        <Typography variant="body2" sx={{ fontSize: '0.75rem' }}>{cite.snippet}</Typography>
+                                      </Box>
+                                    } 
+                                    arrow 
+                                    placement="top"
+                                  >
+                                    <Chip
+                                      size="small"
+                                      label={`${cite.source || 'Doc'} | Page ${cite.page || 1}`}
+                                      color="primary"
+                                      variant="outlined"
+                                      sx={{ fontSize: '0.75rem', fontWeight: 500 }}
+                                    />
+                                  </Tooltip>
+                                ))}
+                              </Box>
+                            </Box>
+                          )}
                         </Box>
                       ) : (
                         <Typography>{message.content}</Typography>

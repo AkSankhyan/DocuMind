@@ -1,256 +1,274 @@
-from fastapi import FastAPI, File, UploadFile, HTTPException, Body
-from fastapi.responses import JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
-import uvicorn
 import os
+import time
+import uuid
 import shutil
 import tempfile
-import time
 import traceback
+from typing import List, Optional
 
-from .schema import QuestionRequest, UploadResponse, ChatResponse
-from .agent import DocumentQAAgent
+from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 
-# Create FastAPI app
+from .schema import QuestionRequest, UploadResponse, ChatResponse, Citation
+from .parsers import DocumentParser
+from .vector_store import VectorStoreManager
+from .agent import AgenticRAG
+from . import config
+
 app = FastAPI(
-    title="Document QA API", 
-    description="API for the Document QA application that processes various document types and answers questions"
+    title="Document Intelligence & Agentic RAG API",
+    description="Enterprise-grade Document QA API with LangGraph, Qdrant Hybrid Search, and FlashRank",
+    version="2.0.0"
 )
 
-# Configure CORS for frontend
+# CORS Configuration
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],  # React frontend URL
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Initialize the QA agent
-agent = DocumentQAAgent()
+# Lazy singleton service instances to prevent lock conflicts with Uvicorn reloader
+_parser: Optional[DocumentParser] = None
+_vector_store: Optional[VectorStoreManager] = None
+_agent: Optional[AgenticRAG] = None
 
-# Create upload directory
-UPLOAD_DIR = os.path.join(os.getcwd(), "data", "uploaded_docs")
-os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+def get_parser() -> DocumentParser:
+    global _parser
+    if _parser is None:
+        _parser = DocumentParser()
+    return _parser
+
+
+def get_vector_store() -> VectorStoreManager:
+    global _vector_store
+    if _vector_store is None:
+        _vector_store = VectorStoreManager()
+    return _vector_store
+
+
+def get_agent() -> AgenticRAG:
+    global _agent
+    if _agent is None:
+        _agent = AgenticRAG(vector_store=get_vector_store())
+    return _agent
+
+
+# Track uploaded documents metadata
+DOCUMENT_REGISTRY = {}
 
 
 @app.post("/api/upload", response_model=UploadResponse)
-async def upload_file(file: UploadFile = File(...)):
-    """Upload a document file for processing"""
+async def upload_document(file: UploadFile = File(...)):
+    """
+    Ingests, parses, chunks, and indexes a document into Qdrant vector store.
+    Supports PDF, DOCX, PPTX, XLSX, and TXT natively.
+    """
     try:
-        print(f"Received file: {file.filename}")
-        
-        # Validate file type
-        file_ext = os.path.splitext(file.filename)[1].lower()
-        supported_extensions = ['.pdf', '.docx', '.doc', '.xlsx', '.xls', '.txt', '.ppt', '.pptx']
-        
-        if file_ext not in supported_extensions:
+        filename = file.filename or "uploaded_document"
+        file_ext = os.path.splitext(filename)[1].lower()
+        supported = [".pdf", ".docx", ".doc", ".pptx", ".ppt", ".xlsx", ".xls", ".txt", ".md", ".csv"]
+
+        if file_ext not in supported:
             raise HTTPException(
                 status_code=400,
-                detail=f"Unsupported file type. Supported types: {', '.join(supported_extensions)}"
+                detail=f"Unsupported format '{file_ext}'. Supported: {', '.join(supported)}"
             )
-        
-        # Check file size (10MB limit)
-        file_size = 0
-        chunk_size = 1024 * 1024  # 1MB chunks
-        with tempfile.NamedTemporaryFile(delete=False) as temp_file:
+
+        # Unique collection ID for session isolation
+        clean_name = re_clean_name(filename)
+        collection_id = f"{clean_name}_{int(time.time())}_{uuid.uuid4().hex[:6]}"
+        file_path = os.path.join(config.UPLOAD_DIR, f"{collection_id}{file_ext}")
+
+        # Stream file to disk in chunks to avoid memory spikes
+        chunk_size = 1024 * 1024  # 1MB
+        with open(file_path, "wb") as buffer:
             while True:
                 chunk = await file.read(chunk_size)
                 if not chunk:
                     break
-                file_size += len(chunk)
-                if file_size > 10 * 1024 * 1024:  # 10MB
-                    os.unlink(temp_file.name)
-                    raise HTTPException(
-                        status_code=400,
-                        detail="File size exceeds 10MB limit"
-                    )
-                temp_file.write(chunk)
-            
-            temp_file_path = temp_file.name
-        
-        # Create a unique filename
-        unique_filename = f"{os.path.splitext(file.filename)[0]}_{int(time.time())}{file_ext}"
-        file_path = os.path.join(UPLOAD_DIR, unique_filename)
-        
-        # Move the temporary file to the upload directory
-        shutil.move(temp_file_path, file_path)
-        
-        print(f"File saved to: {file_path}")
-        print("Processing document...")
-        
-        try:
-            # For document extraction, we use a simple question that doesn't analyze
-            # This ensures we get the raw content rather than a summary or analysis
-            result = agent.run(
-                file_path=file_path, 
-                question="Simply return the raw content of this document without any analysis or summary."
-            )
-            
-            # Verify we got actual content
-            if not result or len(result) < 20:
-                # Try direct extraction instead
-                print("Initial extraction yielded insufficient content, trying direct extraction...")
-                from .processors import DocumentProcessor
-                process_result = DocumentProcessor.process_document({"file_path": file_path})
-                
-                # Extract all document content
-                content = ""
-                if process_result and "documents" in process_result:
-                    for doc in process_result["documents"]:
-                        content += doc.page_content + "\n\n"
-                    
-                    if content.strip():
-                        result = content
-                    else:
-                        raise ValueError("Could not extract text content from document")
-                else:
-                    # If we got an error in processing, report it
-                    if process_result and "error" in process_result:
-                        raise ValueError(process_result["error"])
-                    else:
-                        raise ValueError("Document processing failed to extract text content")
-            
-            # Validate the extracted content
-            if not result or not result.strip() or len(result) < 10:
-                raise ValueError("The document appears to be empty or contains no extractable text content")
-            
-            print(f"Document processed successfully, extracted {len(result)} characters")
-            
-            # Return success response with processed content
-            preview = result[:500] + "..." if len(result) > 500 else result
-            
-            return UploadResponse(
-                status="success",
-                message="File uploaded and processed successfully",
-                filename=unique_filename,
-                content_preview=preview,
-                content=result  # Full processed content
-            )
-            
-        except Exception as e:
-            # Clean up the file if processing fails
-            if os.path.exists(file_path):
-                os.remove(file_path)
-            error_message = str(e)
-            print(f"Error processing file: {error_message}")
-            print("Full traceback:")
-            print(traceback.format_exc())
-            
-            # Custom error messages for common issues
-            if "openpyxl" in error_message.lower() or "xlrd" in error_message.lower():
-                detail = "Excel processing failed: The server is missing required dependencies. Please ask the administrator to install: pip install openpyxl xlrd"
-            elif ".xls" in file_path.lower() and "excel" in error_message.lower():
-                detail = f"Excel processing failed: {error_message}. The file may be password-protected, corrupted, or in an unsupported format."
-            elif "pandoc" in error_message.lower():
-                detail = "PowerPoint processing failed: Pandoc is required but not installed. Please ask the administrator to install Pandoc from https://pandoc.org/installing.html"
-            elif (".ppt" in file_path.lower() or "powerpoint" in error_message.lower()):
-                detail = f"PowerPoint processing failed: {error_message}. The file may be password-protected, corrupted, or in an unsupported format."
-            else:
-                detail = f"Error processing file: {error_message}"
-                
+                buffer.write(chunk)
+
+        print(f"Uploaded file saved to {file_path}. Starting layout-aware parsing...")
+
+        # Parse & Chunk with page metadata
+        chunks, total_pages, preview = get_parser().parse_and_chunk(file_path)
+
+        if not chunks:
             raise HTTPException(
-                status_code=500,
-                detail=detail
+                status_code=400,
+                detail="No readable text or tabular content could be extracted from this document."
             )
-    
+
+        # Index chunks into Qdrant
+        num_indexed = get_vector_store().index_chunks(collection_id=collection_id, chunks=chunks)
+
+        # Store metadata
+        DOCUMENT_REGISTRY[collection_id] = {
+            "collection_id": collection_id,
+            "filename": filename,
+            "file_path": file_path,
+            "total_pages": total_pages,
+            "num_chunks": num_indexed,
+            "created_at": time.time()
+        }
+
+        return UploadResponse(
+            status="success",
+            message="Document successfully parsed and indexed into vector database.",
+            filename=filename,
+            collection_id=collection_id,
+            num_pages=total_pages,
+            num_chunks=num_indexed,
+            content_preview=preview,
+            content=preview
+        )
+
     except HTTPException:
         raise
     except Exception as e:
-        print(f"Error in upload endpoint: {str(e)}")
-        print("Full traceback:")
-        print(traceback.format_exc())
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"Error in upload endpoint: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"Failed to process document: {str(e)}")
 
 
 @app.post("/api/chat", response_model=ChatResponse)
-async def chat(request: QuestionRequest):
-    """Ask a question about the uploaded document"""
+async def chat_with_document(request: QuestionRequest):
+    """
+    Answers questions using the Corrective RAG (CRAG) LangGraph agent.
+    Includes document citations with exact page numbers.
+    """
     try:
-        print(f"Received chat request: {request.question}")
-        print(f"File info available: {request.file_info is not None}")
-        
-        # Validate request
-        if not request.question:
-            raise HTTPException(status_code=400, detail="Question is required")
-        
-        # If we have file info from the frontend
-        if request.file_info and request.file_info.get("content"):
-            print("Using pre-processed content")
-            content_length = len(request.file_info.get("content", ""))
-            print(f"Content length: {content_length}")
-            
-            content = request.file_info.get("content", "").strip()
-            if not content:
+        question = request.question.strip()
+        if not question:
+            raise HTTPException(status_code=400, detail="Question cannot be empty.")
+
+        collection_id = request.collection_id
+
+        # Fallback to the most recent collection if not provided directly
+        if not collection_id:
+            collections = get_vector_store().list_collections()
+            if not collections:
                 raise HTTPException(
                     status_code=400,
-                    detail="The document content is empty. Please try uploading the file again."
+                    detail="No document has been uploaded or indexed yet. Please upload a document first."
                 )
-            
-            # Log the first 200 characters for debugging
-            content_preview = content[:200].replace('\n', ' ') + '...'
-            print(f"Content preview: {content_preview}")
-            
-            try:
-                # Check if the content is too short to be a proper document
-                if len(content) < 50:
-                    raise ValueError("The document content is too short to process. Please upload a valid document.")
-                
-                answer = agent.run(
-                    question=request.question,
-                    pre_processed_content=content
-                )
-                print("Answer generated successfully using pre-processed content")
-            except Exception as e:
-                print(f"Error processing pre-processed content: {str(e)}")
-                print("Full traceback:")
-                print(traceback.format_exc())
-                raise HTTPException(status_code=500, detail=f"Error processing content: {str(e)}")
-        else:
-            print("Looking for uploaded file")
-            # Find the most recent file in the upload directory
-            files = [f for f in os.listdir(UPLOAD_DIR) if os.path.isfile(os.path.join(UPLOAD_DIR, f))]
-            if not files:
-                raise HTTPException(status_code=400, detail="No document has been uploaded")
-            
-            # Sort by modification time, newest first
-            latest_file = max(files, key=lambda f: os.path.getmtime(os.path.join(UPLOAD_DIR, f)))
-            file_path = os.path.join(UPLOAD_DIR, latest_file)
-            print(f"Using file: {latest_file}")
-            
-            try:
-                # Process the question
-                answer = agent.run(
-                    file_path=file_path,
-                    question=request.question
-                )
-                print("Answer generated successfully using file")
-            except Exception as e:
-                print(f"Error processing file: {str(e)}")
-                print("Full traceback:")
-                print(traceback.format_exc())
-                raise HTTPException(status_code=500, detail=f"Error processing file: {str(e)}")
-        
+            collection_id = collections[-1]
+
+        print(f"Executing Agentic RAG for question: '{question}' on collection: '{collection_id}'")
+        result = get_agent().run(question=question, collection_id=collection_id)
+
+        citations_list = [
+            Citation(
+                source=c.get("source", "Document"),
+                page=c.get("page"),
+                snippet=c.get("snippet", ""),
+                score=c.get("score")
+            )
+            for c in result.get("citations", [])
+        ]
+
         return ChatResponse(
             status="success",
-            answer=answer
+            answer=result.get("answer", "No answer could be generated."),
+            citations=citations_list,
+            collection_id=collection_id
         )
-    
+
     except HTTPException:
         raise
     except Exception as e:
-        print(f"Unexpected error in chat endpoint: {str(e)}")
-        print("Full traceback:")
-        print(traceback.format_exc())
-        raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
+        print(f"Error in chat endpoint: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"Error generating answer: {str(e)}")
 
 
-# Main entrypoint for the application
-def run_api_server(host="0.0.0.0", port=8000, reload=True):
-    """Run the FastAPI server"""
-    # Mount the React frontend in production
-    app.mount("/", StaticFiles(directory="frontend/build", html=True), name="frontend")
-    
-    # Start the server
-    uvicorn.run("backend.api:app", host=host, port=port, reload=reload) 
+@app.post("/api/chat/stream")
+async def chat_stream(request: QuestionRequest):
+    """
+    Streaming SSE endpoint — pushes answer tokens as they are generated.
+    Client receives Server-Sent Events with {token} chunks, followed by
+    a final {citations, done: true} event.
+    """
+    question = request.question.strip()
+    if not question:
+        raise HTTPException(status_code=400, detail="Question cannot be empty.")
+
+    collection_id = request.collection_id
+    if not collection_id:
+        collections = get_vector_store().list_collections()
+        if not collections:
+            raise HTTPException(
+                status_code=400,
+                detail="No document has been uploaded or indexed yet. Please upload a document first."
+            )
+        collection_id = collections[-1]
+
+    print(f"[Stream] Starting streaming RAG for: '{question}' on '{collection_id}'")
+
+    def event_generator():
+        try:
+            yield from get_agent().stream_answer(
+                question=question,
+                collection_id=collection_id
+            )
+        except Exception as e:
+            import json
+            yield f"data: {json.dumps({'error': str(e), 'done': True})}\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        }
+    )
+
+
+@app.get("/api/documents")
+async def get_indexed_documents():
+    """Lists all active document collections in the vector store."""
+    collections = get_vector_store().list_collections()
+    docs = []
+    for col in collections:
+        meta = DOCUMENT_REGISTRY.get(col, {
+            "collection_id": col,
+            "filename": col,
+            "created_at": time.time()
+        })
+        docs.append(meta)
+    return {"collections": docs}
+
+
+@app.delete("/api/documents/{collection_id}")
+async def delete_document(collection_id: str):
+    """Deletes an indexed document collection from Qdrant and disk."""
+    try:
+        get_vector_store().delete_collection(collection_id)
+        if collection_id in DOCUMENT_REGISTRY:
+            meta = DOCUMENT_REGISTRY.pop(collection_id)
+            if os.path.exists(meta.get("file_path", "")):
+                os.remove(meta["file_path"])
+        return {"status": "success", "message": f"Collection '{collection_id}' deleted."}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+def re_clean_name(name: str) -> str:
+    """Sanitizes filename for safe collection naming."""
+    base = os.path.splitext(name)[0]
+    return "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in base)[:20]
+
+
+def run_api_server(host="0.0.0.0", port=8000, reload=False):
+    """Launches the Uvicorn ASGI server."""
+    import uvicorn
+    frontend_build = os.path.join(config.BASE_DIR, "frontend", "build")
+    if os.path.exists(frontend_build):
+        app.mount("/", StaticFiles(directory=frontend_build, html=True), name="frontend")
+    uvicorn.run("backend.api:app", host=host, port=port, reload=reload)

@@ -12,13 +12,15 @@ build/
 venv/
 env/
 ENV/
+.venv/
 
 # Environment variables
 .env
 
-# Uploaded documents (test files)
+# Local Data and Vector DB
 data/uploaded_docs/*
 !data/uploaded_docs/.gitkeep
+data/qdrant_db/
 
 # IDE files
 .vscode/

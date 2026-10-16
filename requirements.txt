@@ -1,16 +1,27 @@
-fastapi>=0.109.0
-uvicorn>=0.27.0
-python-multipart>=0.0.6
-pandas>=2.0.3
-docx2txt>=0.8
-PyPDF2>=3.0.1
+# Core Web API & Server
+fastapi>=0.115.0
+uvicorn>=0.30.0
+python-multipart>=0.0.9
+pydantic>=2.8.0
 python-dotenv>=1.0.1
-pypandoc>=1.13
-pydantic>=2.5.3
-langchain>=0.1.0
-langchain-core>=0.1.14
-langchain-groq>=0.1.4
-langgraph>=0.1.14
-groq>=0.4.1
+
+# Modern Document Parsers (Native Python - No Pandoc required!)
+pymupdf>=1.24.0
+pymupdf4llm>=0.0.17
+python-docx>=1.1.0
+python-pptx>=0.6.23
 openpyxl>=3.1.2
-xlrd>=2.0.1
+pandas>=2.2.0
+
+# LLM & Agent Orchestration (Modern LangChain / LangGraph 0.3+ stack)
+langchain>=0.3.0
+langchain-core>=0.3.0
+langchain-groq>=0.2.0
+langchain-text-splitters>=0.3.0
+langgraph>=0.2.20
+groq>=0.9.0
+
+# Vector Database, Local Embeddings & Reranking (Self-contained, CPU-optimized ONNX)
+qdrant-client>=1.11.0
+fastembed>=0.3.4
+flashrank>=0.2.9

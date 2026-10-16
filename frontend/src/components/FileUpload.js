@@ -78,7 +78,7 @@ const ACCEPTED_FILE_TYPES = {
 };
 
 const FileUpload = () => {
-  const { setUploadedFile, setFileContent, setFileType, setIsProcessing } = useFile();
+  const { setUploadedFile, setCollectionId, setDocStats, setFileContent, setFileType, setIsProcessing } = useFile();
   const [file, setFile] = useState(null);
   const [uploading, setUploading] = useState(false);
   const [uploadStatus, setUploadStatus] = useState(null);
@@ -130,17 +130,17 @@ const FileUpload = () => {
         },
       });
       
-      console.log('Upload response status:', response.status);
+      console.log('Upload response:', response.data);
       
       if (response.data && response.data.status === 'success') {
-        if (!response.data.content) {
-          throw new Error('No content received from server. The document may be empty or could not be processed.');
-        }
-        
-        console.log('Received content length:', response.data.content.length);
         setUploadStatus('success');
         setUploadedFile(file);
-        setFileContent(response.data.content);  // Store the full content
+        setCollectionId(response.data.collection_id);
+        setDocStats({
+          numPages: response.data.num_pages || 1,
+          numChunks: response.data.num_chunks || 0
+        });
+        setFileContent(response.data.content_preview || response.data.content || file.name);
         setFileType(file.type);
         
         // Navigate to chat after successful upload
